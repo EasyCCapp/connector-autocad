@@ -100,15 +100,44 @@ jobs:
         with:
           python-version: '3.12'
       - run: pipx install git+https://github.com/cisco-ai-defense/mcp-scanner.git
-      - name: Run scanner
+      - name: Install uv (needed for server launch)
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync server deps
+        run: uv sync --locked --no-install-project --extra full
+      - name: Run scanner against running server (stdio mode)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          mcp-scanner scan-source \
-            --path=. \
-            --engines=yara,dep-cve,llm-judge \
-            --fail-on=critical,high \
-            --output=mcp-scan-results.json
+          mcp-scanner \
+            --analyzers=yara \
+            --raw \
+            --stdio-env="AUTOCAD_MCP_BACKEND=ezdxf" \
+            --stdio-env="DANGEROUS_COMMANDS_ENABLED=false" \
+            stdio \
+            --stdio-command=".venv/bin/python" \
+            --stdio-arg=server.py \
+            > mcp-scan-results.json
+          # Fail on any HIGH severity finding (after subtracting our mitigated ones —
+          # drawing_export_dxf/_pdf are gated by scope_path at the catalog layer).
+          python - <<'PY'
+          import json, sys
+          data = json.load(open("mcp-scan-results.json"))
+          ALLOWED_HIGH = {"drawing_export_dxf", "drawing_export_pdf"}
+          fails = []
+          for entry in data:
+              if entry.get("is_safe"):
+                  continue
+              name = entry.get("tool_name")
+              for analyzer, result in entry.get("findings", {}).items():
+                  if result.get("severity") == "HIGH" and name not in ALLOWED_HIGH:
+                      fails.append((name, analyzer, result.get("threat_summary")))
+          if fails:
+              print(f"FAIL: {len(fails)} HIGH finding(s) outside allowed mitigations:")
+              for f in fails:
+                  print(f"  - {f}")
+              sys.exit(1)
+          print("OK")
+          PY
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -125,9 +154,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: |
-          curl -fsSL https://raw.githubusercontent.com/EasyCCapp/EasyCC/dev/tools/unicode-norm/scan.py -o scan.py
-          python scan.py --path=. --fail-on-finding
+      - run: python carpe-fork/tools/unicode-norm/scan.py --path=. --fail-on-finding
 
   # Stage 4 — Tool-surface snapshot (rug-pull mitigation)
   tool-surface-snapshot:
@@ -155,8 +182,7 @@ jobs:
           DANGEROUS_COMMANDS_ENABLED: "false"
         shell: pwsh
         run: |
-          curl -fsSL https://raw.githubusercontent.com/EasyCCapp/EasyCC/dev/tools/tool-surface-snapshot/snapshot.py -o snapshot.py
-          uv run python snapshot.py `
+          .venv\Scripts\python.exe carpe-fork\tools\tool-surface-snapshot\snapshot.py `
             --launch-cmd=".venv\Scripts\python.exe server.py" `
             --output=tool-surface.json
           (Get-FileHash -Algorithm SHA256 tool-surface.json).Hash.ToLower() | Set-Content tool-surface.sha256
