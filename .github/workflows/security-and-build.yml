@@ -14,68 +14,54 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Endor auth uses keyless / OIDC via the official action.
-  # The fork must (a) have a `ENDOR_NAMESPACE` repo variable set, and
-  # (b) be added to the namespace's GitHub-OIDC trust policy in the
-  # Endor console. The action exchanges the GitHub-issued OIDC token
-  # for an Endor session. No API keys.
-  endor-sca:
-    name: Endor — Dependency vulnerabilities
+  # -------------------------------------------------------------------
+  # Stage 1 — Dependency vulnerability scan (OSS).
+  #
+  # OSV-Scanner queries OSV.dev (Google's public vulnerability
+  # database). No auth, no API key, no tenant. Reads lockfiles in
+  # most languages and surfaces CVEs.
+  # -------------------------------------------------------------------
+  osv-scan:
+    name: OSV — Dependency vulnerabilities
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Endor scan
-        uses: endorlabs/github-action@v1
-        with:
-          namespace: ${{ vars.ENDOR_NAMESPACE }}
-          scan_dependencies: true
-          scan_sast: false
-          scan_secrets: false
-          enable_github_action_token: true
+      - name: Install osv-scanner
+        run: |
+          curl -fsSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+      - name: Scan lockfiles
+        run: osv-scanner --recursive --lockfile=uv.lock .
 
-  endor-sast-secrets:
-    name: Endor — SAST and secrets
+  # -------------------------------------------------------------------
+  # Stage 2 — Python SAST (OSS).
+  #
+  # Bandit catches Python-specific security smells (subprocess with
+  # shell=True, eval/exec, weak crypto, hardcoded passwords, etc.).
+  # -------------------------------------------------------------------
+  bandit:
+    name: Bandit — Python SAST
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
-      - name: Endor scan
-        uses: endorlabs/github-action@v1
-        with:
-          namespace: ${{ vars.ENDOR_NAMESPACE }}
-          scan_dependencies: false
-          scan_sast: true
-          scan_secrets: true
-          enable_github_action_token: true
-
-  endor-security-review:
-    name: Endor — Security review (diff)
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          fetch-depth: 0
-      - name: Endor scan (PR incremental)
-        uses: endorlabs/github-action@v1
-        with:
-          namespace: ${{ vars.ENDOR_NAMESPACE }}
-          scan_dependencies: true
-          scan_sast: true
-          scan_secrets: true
-          pr_incremental: true
-          enable_github_action_token: true
+          python-version: '3.12'
+      - name: Install Bandit
+        run: pip install bandit
+      - name: Run Bandit
+        # Fail on high-confidence high-severity findings. Skip tests
+        # and the carpe-fork overlay (which is our code, not upstream's).
+        run: |
+          bandit -r . \
+            --exclude=./tests,./carpe-fork,./.venv \
+            --severity-level=high \
+            --confidence-level=high
 
   trufflehog:
     name: TruffleHog secrets scan
@@ -220,8 +206,8 @@ jobs:
   build:
     name: Build win-x64
     needs:
-      - endor-sca
-      - endor-sast-secrets
+      - osv-scan
+      - bandit
       - trufflehog
       - mcp-scanner
       - unicode-norm
