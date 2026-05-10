@@ -13,13 +13,12 @@ on:
       - 'v*'
   workflow_dispatch:
 
-env:
-  ENDOR_NAMESPACE: ${{ vars.ENDOR_NAMESPACE }}
-
 jobs:
-  # Endor auth uses OIDC. Set ENDOR_NAMESPACE as a repository variable
-  # and add this fork repo to the namespace's OIDC trust policy. No
-  # API keys.
+  # Endor auth uses keyless / OIDC via the official action.
+  # The fork must (a) have a `ENDOR_NAMESPACE` repo variable set, and
+  # (b) be added to the namespace's GitHub-OIDC trust policy in the
+  # Endor console. The action exchanges the GitHub-issued OIDC token
+  # for an Endor session. No API keys.
   endor-sca:
     name: Endor — Dependency vulnerabilities
     runs-on: ubuntu-latest
@@ -28,11 +27,14 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Install endorctl
-        run: |
-          curl -L https://api.endorlabs.com/download/latest/endorctl_linux_amd64 -o endorctl
-          chmod +x endorctl
-      - run: ./endorctl scan --dependencies --fail-on=critical,high
+      - name: Endor scan
+        uses: endorlabs/github-action@v1
+        with:
+          namespace: ${{ vars.ENDOR_NAMESPACE }}
+          scan_dependencies: true
+          scan_sast: false
+          scan_secrets: false
+          enable_github_action_token: true
 
   endor-sast-secrets:
     name: Endor — SAST and secrets
@@ -44,11 +46,14 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
-      - name: Install endorctl
-        run: |
-          curl -L https://api.endorlabs.com/download/latest/endorctl_linux_amd64 -o endorctl
-          chmod +x endorctl
-      - run: ./endorctl scan --sast --secrets --fail-on=critical,high
+      - name: Endor scan
+        uses: endorlabs/github-action@v1
+        with:
+          namespace: ${{ vars.ENDOR_NAMESPACE }}
+          scan_dependencies: false
+          scan_sast: true
+          scan_secrets: true
+          enable_github_action_token: true
 
   endor-security-review:
     name: Endor — Security review (diff)
@@ -62,15 +67,15 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
-      - name: Install endorctl
-        run: |
-          curl -L https://api.endorlabs.com/download/latest/endorctl_linux_amd64 -o endorctl
-          chmod +x endorctl
-      - run: |
-          ./endorctl security-review \
-            --base=origin/${{ github.base_ref }} \
-            --head=HEAD \
-            --fail-on=critical,high
+      - name: Endor scan (PR incremental)
+        uses: endorlabs/github-action@v1
+        with:
+          namespace: ${{ vars.ENDOR_NAMESPACE }}
+          scan_dependencies: true
+          scan_sast: true
+          scan_secrets: true
+          pr_incremental: true
+          enable_github_action_token: true
 
   trufflehog:
     name: TruffleHog secrets scan
