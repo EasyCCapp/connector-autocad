@@ -102,8 +102,11 @@ jobs:
       - run: pipx install git+https://github.com/cisco-ai-defense/mcp-scanner.git
       - name: Install uv (needed for server launch)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
-      - name: Sync server deps
-        run: uv sync --locked --no-install-project --extra full
+      - name: Sync server deps (base only — pywin32 is Windows-only)
+        # No --extra full here: pywin32 has no Linux wheel. Base deps
+        # (fastmcp + ezdxf + pydantic) are enough for tool enumeration
+        # via the ezdxf backend.
+        run: uv sync --locked --no-install-project
       - name: Run scanner against running server (stdio mode)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
