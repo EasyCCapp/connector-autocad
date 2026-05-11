@@ -57,14 +57,12 @@ foreach ($p in $shipPaths) {
         throw "Expected path missing from fork tree: $p"
     }
     Write-Host "[build] Copying $p"
+    # Copy-Item on a file path puts it at the destination root regardless
+    # of the source-side nesting. carpe-fork\run.cmd lands as $staging\run.cmd,
+    # which is exactly what connector.json's `${connector_dir}/run.cmd`
+    # launch line expects.
     Copy-Item -Recurse -Path $p -Destination $staging
 }
-
-# Move run.cmd from carpe-fork/ to the bundle root so the launch.command
-# in connector.json (`${connector_dir}/run.cmd`) resolves directly.
-Move-Item -Path (Join-Path $staging "carpe-fork\run.cmd") `
-          -Destination (Join-Path $staging "run.cmd") -Force
-Remove-Item -Recurse -Force (Join-Path $staging "carpe-fork")
 
 # 3. Zip
 if (-not (Test-Path $OutputDir)) {
