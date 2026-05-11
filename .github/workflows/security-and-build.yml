@@ -1,0 +1,261 @@
+# AutoCAD MCP connector — security gates + build + release
+#
+# Customized from .github/connector-fork-ci-template.yml in the EasyCC repo.
+# Drops in at .github/workflows/security-and-build.yml in the fork.
+
+name: Connector security and build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------------------
+  # Stage 1 — Dependency vulnerability scan (OSS).
+  #
+  # OSV-Scanner queries OSV.dev (Google's public vulnerability
+  # database). No auth, no API key, no tenant. Reads lockfiles in
+  # most languages and surfaces CVEs.
+  # -------------------------------------------------------------------
+  osv-scan:
+    name: OSV — Dependency vulnerabilities
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install osv-scanner
+        run: |
+          curl -fsSL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+      - name: Scan lockfiles
+        run: osv-scanner --recursive --lockfile=uv.lock .
+
+  # -------------------------------------------------------------------
+  # Stage 2 — Python SAST (OSS).
+  #
+  # Bandit catches Python-specific security smells (subprocess with
+  # shell=True, eval/exec, weak crypto, hardcoded passwords, etc.).
+  # -------------------------------------------------------------------
+  bandit:
+    name: Bandit — Python SAST
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Bandit
+        run: pip install bandit
+      - name: Run Bandit
+        # Fail on high-confidence high-severity findings. Skip tests
+        # and the carpe-fork overlay (which is our code, not upstream's).
+        run: |
+          bandit -r . \
+            --exclude=./tests,./carpe-fork,./.venv \
+            --severity-level=high \
+            --confidence-level=high
+
+  trufflehog:
+    name: TruffleHog secrets scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+      - uses: trufflesecurity/trufflehog@47e7b7cd74f578e1e3145d48f669f22fd1330ca6 # v3.94.3
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  # Stage 3 — MCP-specific static analysis
+  mcp-scanner:
+    name: MCP-specific static scan (Cisco)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pipx install git+https://github.com/cisco-ai-defense/mcp-scanner.git
+      - name: Install uv (needed for server launch)
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync server deps (base only — pywin32 is Windows-only)
+        # No --extra full here: pywin32 has no Linux wheel. Base deps
+        # (fastmcp + ezdxf + pydantic) are enough for tool enumeration
+        # via the ezdxf backend.
+        run: uv sync --locked --no-install-project
+      - name: Run scanner against running server (stdio mode)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          mcp-scanner \
+            --analyzers=yara \
+            --raw \
+            --stdio-env="AUTOCAD_MCP_BACKEND=ezdxf" \
+            --stdio-env="DANGEROUS_COMMANDS_ENABLED=false" \
+            stdio \
+            --stdio-command=".venv/bin/python" \
+            --stdio-arg=server.py \
+            > mcp-scan-results.json
+          # Fail on any HIGH severity finding (after subtracting our mitigated ones —
+          # drawing_export_dxf/_pdf are gated by scope_path at the catalog layer).
+          python - <<'PY'
+          import json, sys
+          data = json.load(open("mcp-scan-results.json"))
+          ALLOWED_HIGH = {"drawing_export_dxf", "drawing_export_pdf"}
+          fails = []
+          for entry in data:
+              if entry.get("is_safe"):
+                  continue
+              name = entry.get("tool_name")
+              for analyzer, result in entry.get("findings", {}).items():
+                  if result.get("severity") == "HIGH" and name not in ALLOWED_HIGH:
+                      fails.append((name, analyzer, result.get("threat_summary")))
+          if fails:
+              print(f"FAIL: {len(fails)} HIGH finding(s) outside allowed mitigations:")
+              for f in fails:
+                  print(f"  - {f}")
+              sys.exit(1)
+          print("OK")
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-scan-results
+          path: mcp-scan-results.json
+
+  unicode-norm:
+    name: Unicode normalization scan (Carpe)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python carpe-fork/tools/unicode-norm/scan.py --path=. --fail-on-finding
+
+  # Stage 4 — Tool-surface snapshot (rug-pull mitigation)
+  tool-surface-snapshot:
+    name: Tool-surface snapshot (Carpe)
+    runs-on: windows-latest  # AutoCAD MCP requires Windows for backend init
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install uv
+        run: irm https://astral.sh/uv/install.ps1 | iex
+        shell: pwsh
+      - name: uv sync --locked --no-install-project --extra full
+        # Upstream's hatch-based pyproject.toml doesn't declare packages, so
+        # installing the project itself fails. We only need runtime deps;
+        # --extra full pulls pywin32 + Pillow + matplotlib.
+        run: uv sync --locked --no-install-project --extra full
+        shell: pwsh
+      - name: Snapshot tool surface
+        # Forces ezdxf backend so the snapshot doesn't require AutoCAD installed
+        # in CI. The tool list is identical between backends — only behavior
+        # differs at call time.
+        env:
+          AUTOCAD_MCP_BACKEND: ezdxf
+          DANGEROUS_COMMANDS_ENABLED: "false"
+        shell: pwsh
+        run: |
+          .venv\Scripts\python.exe carpe-fork\tools\tool-surface-snapshot\snapshot.py `
+            --launch-cmd=".venv\Scripts\python.exe server.py" `
+            --output=tool-surface.json
+          (Get-FileHash -Algorithm SHA256 tool-surface.json).Hash.ToLower() | Set-Content tool-surface.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tool-surface
+          path: |
+            tool-surface.json
+            tool-surface.sha256
+
+  lockfile-sanity:
+    name: Lockfile present and matches manifest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Verify uv.lock + pyproject.toml in sync
+        run: |
+          set -e
+          test -f pyproject.toml || (echo "pyproject.toml missing" && exit 1)
+          test -f uv.lock || (echo "uv.lock missing" && exit 1)
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv lock --check
+
+  build:
+    name: Build win-x64
+    needs:
+      - osv-scan
+      - bandit
+      - trufflehog
+      - mcp-scanner
+      - unicode-norm
+      - tool-surface-snapshot
+      - lockfile-sanity
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+        shell: pwsh
+
+      - name: Build connector zip
+        run: .\carpe-fork\build.ps1
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-win-x64
+          path: |
+            dist/autocad-mcp-win-x64.zip
+            dist/autocad-mcp-win-x64.zip.sha256
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
