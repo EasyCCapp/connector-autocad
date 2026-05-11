@@ -16,7 +16,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$forkRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$forkRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $forkRoot
 
 Write-Host "[build] Fork root: $forkRoot"
